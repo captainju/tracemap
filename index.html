@@ -1,0 +1,1396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TraceMap</title>
+<!-- Favicon inline (SVG data URL): a route with a green start dot. The page stays one file. -->
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='%231565c0'/><path d='M14 50 C26 50 20 30 32 30 S40 14 50 14' fill='none' stroke='white' stroke-width='6' stroke-linecap='round'/><circle cx='14' cy='50' r='7' fill='%232e7d32' stroke='white' stroke-width='3'/><circle cx='50' cy='14' r='5' fill='white'/></svg>">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<style>
+    /* Leaflet shows the "grab" cursor on the map. Some Linux cursor themes (for example DMZ) have no "grab" cursor,
+       and Chrome then shows no cursor. Use the crosshair: all cursor themes have it. */
+    .leaflet-grab { cursor: crosshair; }
+    html, body, #map { height: 100%; margin: 0; }
+    .panel { background: #fff; padding: 8px; border-radius: 4px; box-shadow: 0 1px 5px rgba(0, 0, 0, .4);
+             font: 14px sans-serif; display: flex; flex-direction: column; gap: 6px; width: 210px; }
+    #length { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); z-index: 1000;
+              pointer-events: none; background: #fff; padding: 4px 14px; border-radius: 4px;
+              box-shadow: 0 1px 5px rgba(0, 0, 0, .4); font: bold 22px sans-serif; text-align: center; }
+    #meter2 { font: 14px sans-serif; color: #333; }
+    #meter2:empty { display: none; }
+    .panel .field { display: flex; gap: 6px; align-items: center; }
+    #pace { flex: 0 0 4em; }
+    #pace.invalid { outline: 2px solid #c00; }
+    .km { background: #fff; border: 2px solid #1565c0; border-radius: 50%; box-sizing: border-box; color: #1565c0;
+          font: bold 11px sans-serif; display: flex; align-items: center; justify-content: center; }
+    .panel .buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+    .panel form { display: flex; gap: 4px; }
+    .panel input { flex: 1; min-width: 0; }
+    .panel #status, .panel #favStatus { min-height: 1.2em; overflow-wrap: anywhere; }
+    .panel .help { color: #666; font-size: 12px; }
+    .point { background: #fff; border: 3px solid #1565c0; border-radius: 50%; box-sizing: border-box; }
+    .point.start { border-color: #2e7d32; }
+    .handle { background: #fff; border: 2px solid #1565c0; border-radius: 50%; box-sizing: border-box; opacity: .6; }
+    .home { font-size: 24px; line-height: 28px; text-align: center; }
+    .arrow svg { display: block; }
+    [hidden] { display: none !important; }
+    .panel .row { display: flex; gap: 4px; }
+    .panel .row > * { flex: 1; }
+    #favOpen { background: #fff; border: none; border-radius: 4px; box-shadow: 0 1px 5px rgba(0, 0, 0, .4);
+               padding: 6px 10px; font: bold 14px sans-serif; cursor: pointer; }
+    .favs { width: 300px; max-height: calc(100vh - 220px); box-sizing: border-box; }
+    .profile { width: calc(100vw - 78px); height: 150px; background: #fcfcfb; border-radius: 4px; position: relative;
+               box-shadow: 0 1px 5px rgba(0, 0, 0, .4); font: 11px system-ui, sans-serif; cursor: crosshair; }
+    .profile svg { display: block; }
+    .profile .tip { position: absolute; top: 2px; pointer-events: none; background: #fff; white-space: nowrap;
+                    border: 1px solid rgba(11, 11, 11, .1); border-radius: 4px; padding: 1px 6px;
+                    font: 12px system-ui, sans-serif; color: #52514e; }
+    .profile .tip b { color: #0b0b0b; }
+    .favs .head { display: flex; justify-content: space-between; align-items: center; }
+    #favList { overflow-y: auto; min-height: 0; flex: 1; display: flex; flex-direction: column; gap: 4px; }
+    .fav { display: grid; grid-template-columns: 96px 1fr auto; gap: 6px; padding: 4px; border-radius: 4px; align-items: center; }
+    .fav.current { background: #e3f2fd; }
+    .fav svg, .fav .name { cursor: pointer; }
+    .fav .name { font-weight: bold; overflow-wrap: anywhere; }
+    .fav .meta { color: #555; font-size: 12px; }
+    .fav .actions { display: flex; flex-direction: column; gap: 2px; }
+    .fav .confirm { grid-column: 1 / -1; display: flex; gap: 4px; align-items: center; font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="length"><div id="meter1">0.00 km</div><div id="meter2"></div></div>
+<script>
+// Zoom on the home at first load. Without a home, the map shows all of metropolitan France.
+const START_ZOOM = 16;
+const FRANCE_BOUNDS = [[41.3, -5.2], [51.1, 9.6]];
+const HOME_KEY = 'tracemap.home';
+const BROUTER_URL = 'https://brouter.de/brouter';
+// Routing profiles: the key is stored in each routed segment, the value is the BRouter profile.
+const PROFILES = { trail: 'hiking-mountain', road: 'trekking' };
+const DEFAULT_PROFILE = 'trail';
+const NOMINATIM_URL = 'https://nominatim.openstreetmap.org/search';
+const STORAGE_KEY = 'tracemap.route';
+const FAVORITES_KEY = 'tracemap.favorites';
+const COLOR = '#1565c0';
+// During a drag, the page sends a routing request only when the point stays
+// within DRAG_DELTA_PX pixels for DRAG_PAUSE_MS milliseconds.
+const DRAG_PAUSE_MS = 300;
+const DRAG_DELTA_PX = 5;
+// The climb and descent ignore elevation changes smaller than this value, to remove the noise of the data.
+const CLIMB_THRESHOLD_M = 5;
+// Distance between two direction arrows on the route.
+const ARROW_SPACING_M = 500;
+// A km marker closer than KM_CLEAR_PX to a route point moves KM_SHIFT_PX away, on the side farthest from the route.
+const KM_CLEAR_PX = 20, KM_SHIFT_PX = 18;
+// Distance between two route points on an imported GPX track.
+const IMPORT_POINT_SPACING_M = 1000;
+// A clicked point this close to the end of the BRouter route replaces that end: no detour to the clicked point.
+const JOIN_MAX_M = 5;
+// On GPX import, a detour "A, point, A" shorter than this is an old TraceMap junction, and the page removes it.
+const DETOUR_MAX_M = 25;
+// Surface classes for the surface split (SPEC.md section 7.4).
+const TRAIL_SURFACES = new Set(['unpaved', 'gravel', 'fine_gravel', 'compacted', 'dirt', 'earth', 'ground', 'grass',
+                                'mud', 'sand', 'woodchips', 'pebblestone', 'rock']);
+const ROAD_SURFACES = new Set(['paved', 'asphalt', 'concrete', 'paving_stones', 'sett', 'cobblestone']);
+const TRAIL_HIGHWAYS = new Set(['track', 'path', 'bridleway']);
+
+// segs[i] joins points[i] to points[i + 1]. closing joins the last point to the first point.
+let state = { points: [], segs: [], closing: null };
+let undoStack = [];  // JSON snapshots of state, taken before each action
+let busy = false;
+// favoriteId links the current route to a favorite. dirty is true when the route changed after the last save or load.
+let favoriteId = null;
+let dirty = false;
+let importedName = '';  // name of the last imported GPX track: the default name for "Save as new"
+let favorites = [];  // [{ id, name, savedAt (ISO date), route: { points, segs, closing } }]
+
+// The home is [lat, lng], set by the user, or null.
+let home = null;
+try { home = JSON.parse(localStorage.getItem(HOME_KEY)); } catch { /* not valid JSON: no home */ }
+if (!(Array.isArray(home) && home.length === 2 && home.every(Number.isFinite))) home = null;
+let pickingHome = false;  // true after a click on "Set home": the next left click on the map sets the home
+
+const map = L.map('map', { doubleClickZoom: false, zoomControl: false });
+if (home) map.setView(home, START_ZOOM);
+else map.fitBounds(FRANCE_BOUNDS, { animate: false });
+L.control.zoom({ position: 'bottomright' }).addTo(map);
+// Map backgrounds, all with OpenStreetMap data. The page does not use tile.openstreetmap.org: that server
+// blocks a page opened as a file, because the browser sends no Referer header.
+const OSM_ATTRIBUTION = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
+const BASEMAPS = {
+    'OSM France': L.tileLayer('https://{s}.tile.openstreetmap.fr/osmfr/{z}/{x}/{y}.png', {
+        maxZoom: 19, maxNativeZoom: 18,  // the server has no zoom 19 tiles (404)
+        attribution: OSM_ATTRIBUTION + ', tiles <a href="https://www.openstreetmap.fr">OSM France</a>' }),
+    'CyclOSM': L.tileLayer('https://{s}.tile-cyclosm.openstreetmap.fr/cyclosm/{z}/{x}/{y}.png', {
+        maxZoom: 19, attribution: OSM_ATTRIBUTION + ', style <a href="https://www.cyclosm.org">CyclOSM</a>' }),
+    'OpenTopoMap': L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19, maxNativeZoom: 17,
+        attribution: OSM_ATTRIBUTION + ', SRTM, style <a href="https://opentopomap.org">OpenTopoMap</a> (CC-BY-SA)' }),
+};
+const BASEMAP_KEY = 'tracemap.basemap';
+(BASEMAPS[localStorage.getItem(BASEMAP_KEY)] ?? BASEMAPS['OSM France']).addTo(map);
+L.control.layers(BASEMAPS, null, { position: 'bottomright' }).addTo(map);
+map.on('baselayerchange', e => localStorage.setItem(BASEMAP_KEY, e.name));
+const homeMarker = L.marker([0, 0], { interactive: false, keyboard: false,
+                                     icon: L.divIcon({ className: 'home', html: '🏠', iconSize: [28, 28] }) });
+if (home) homeMarker.setLatLng(home).addTo(map);
+const lineLayer = L.layerGroup().addTo(map);
+const markerLayer = L.layerGroup().addTo(map);
+const pointIcon = L.divIcon({ className: 'point', iconSize: [14, 14] });
+const startIcon = L.divIcon({ className: 'point start', iconSize: [14, 14] });
+const handleIcon = L.divIcon({ className: 'handle', iconSize: [10, 10] });
+
+const panel = L.control({ position: 'topright' });
+panel.onAdd = () => {
+    const div = L.DomUtil.create('div', 'panel');
+    div.innerHTML = `
+        <div class="buttons">
+            <button id="undo">Undo</button><button id="reset">Reset</button>
+            <button id="close">Close loop</button><button id="outBack">Out and back</button>
+            <button id="gpxImport">Import GPX</button><button id="gpx">Export GPX</button>
+            <button id="homeSet">Set home</button><button id="homeRemove">Remove home</button>
+        </div>
+        <input type="file" id="gpxFile" accept=".gpx,application/gpx+xml" hidden>
+        <label class="field">Routing <select id="profile"><option value="trail">Trail</option><option value="road">Road</option></select></label>
+        <label class="field">Pace <input id="pace" value="6:00"> /km</label>
+        <label><input type="checkbox" id="arrows" checked> Show direction arrows</label>
+        <label><input type="checkbox" id="kms" checked> Show km markers</label>
+        <label><input type="checkbox" id="elevation" checked> Show elevation profile</label>
+        <form id="search"><input name="q" placeholder="Search a place"><button>Search</button></form>
+        <div id="status"></div>
+        <div class="help">Left click: straight line. Right click: follow paths. Drag a point to move it. Drag a faded dot to insert a point: left button for straight lines, right button to follow paths. Double-click a point to remove it.</div>`;
+    L.DomEvent.disableClickPropagation(div);
+    L.DomEvent.disableScrollPropagation(div);
+    // Leaflet finds the panel from the clicked element. If a click handler removes that element
+    // (for example, the list redraws), Leaflet does not find it and adds a point. Stop the click here.
+    L.DomEvent.on(div, 'click', L.DomEvent.stopPropagation);
+    return div;
+};
+panel.addTo(map);
+
+const favButton = L.control({ position: 'topleft' });
+favButton.onAdd = () => {
+    const button = L.DomUtil.create('button');
+    button.id = 'favOpen';
+    button.textContent = '★ Favorites';
+    L.DomEvent.disableClickPropagation(button);
+    L.DomEvent.on(button, 'click', L.DomEvent.stopPropagation);
+    return button;
+};
+favButton.addTo(map);
+
+const favPanel = L.control({ position: 'topleft' });
+favPanel.onAdd = () => {
+    const div = L.DomUtil.create('div', 'panel favs');
+    div.id = 'favs';
+    div.hidden = true;
+    div.innerHTML = `
+        <div class="head"><b>Favorites</b><button id="favClose" title="Close">✕</button></div>
+        <div id="curName"></div>
+        <div class="row"><button id="favSave">Save</button><button id="favSaveNew">Save as new</button></div>
+        <form id="nameForm" class="row" hidden>
+            <input id="nameInput" maxlength="100"><button>OK</button><button type="button" id="nameCancel">Cancel</button>
+        </form>
+        <input id="favSearch" placeholder="Search favorites">
+        <div id="favList"></div>
+        <div class="row"><button id="favExport">Export</button><button id="favImport">Import</button></div>
+        <input type="file" id="favFile" accept=".json,application/json" hidden>
+        <div id="favStatus"></div>`;
+    L.DomEvent.disableClickPropagation(div);
+    L.DomEvent.disableScrollPropagation(div);
+    // Leaflet finds the panel from the clicked element. If a click handler removes that element
+    // (for example, the list redraws), Leaflet does not find it and adds a point. Stop the click here.
+    L.DomEvent.on(div, 'click', L.DomEvent.stopPropagation);
+    return div;
+};
+favPanel.addTo(map);
+
+const profileBox = L.control({ position: 'bottomleft' });
+profileBox.onAdd = () => {
+    const div = L.DomUtil.create('div', 'profile');
+    div.id = 'elevProfile';
+    div.hidden = true;
+    div.style.marginBottom = '22px';  // above the attribution line
+    div.innerHTML = '<svg id="profileSvg"></svg><div class="tip" id="profileTip" hidden></div>';
+    L.DomEvent.disableClickPropagation(div);
+    L.DomEvent.disableScrollPropagation(div);
+    L.DomEvent.on(div, 'click', L.DomEvent.stopPropagation);
+    // The chart has its own hover. The map must not see these moves, or it hides the hover.
+    L.DomEvent.on(div, 'mousemove', L.DomEvent.stopPropagation);
+    return div;
+};
+profileBox.addTo(map);
+const $ = id => document.getElementById(id);
+
+let statusTimer, statusError = false;
+// Shows a message in the control panel, or in the favorites panel when it is open.
+// An error message, or a message with temporary = true, disappears after 5 seconds.
+function showStatus(text, isError = false, temporary = isError) {
+    clearTimeout(statusTimer);
+    for (const id of ['status', 'favStatus']) $(id).textContent = '';
+    const el = $($('favs').hidden ? 'status' : 'favStatus');
+    el.textContent = text;
+    el.style.color = isError ? '#c00' : '#555';
+    statusError = isError && !!text;
+    if (temporary) statusTimer = setTimeout(() => showStatus(''), 5000);
+}
+
+const allSegs = (s = state) => s.closing ? [...s.segs, s.closing] : s.segs;
+// All coordinates of the route, in order, without the repeated point between two segments.
+const routeCoords = s => allSegs(s).flatMap((g, k) => k ? g.coords.slice(1) : g.coords);
+
+// Distance in meters from the first coordinate to each coordinate.
+function cumulative(coords) {
+    const dist = [0];
+    for (let k = 1; k < coords.length; k++) dist.push(dist[k - 1] + map.distance(coords[k - 1], coords[k]));
+    return dist;
+}
+
+// Point at the middle of a geometry, along the distance. mid is the index of the coordinate just before it.
+function midpoint(coords) {
+    const dist = cumulative(coords), half = dist.at(-1) / 2;
+    let mid = 0;
+    while (mid < coords.length - 2 && dist[mid + 1] < half) mid++;
+    const a = coords[mid], b = coords[mid + 1], t = (half - dist[mid]) / (dist[mid + 1] - dist[mid] || 1);
+    return { p: [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])], mid };
+}
+
+// Elevation of each coordinate. A coordinate is [lat, lng] or [lat, lng, elevation].
+// A coordinate without elevation gets a linear interpolation along the distance.
+// Returns null if no coordinate has an elevation.
+function elevations(coords) {
+    const known = coords.flatMap((c, k) => c.length > 2 ? [k] : []);
+    if (!known.length) return null;
+    const dist = cumulative(coords);
+    let j = 0;
+    return coords.map((c, k) => {
+        while (j < known.length - 1 && known[j + 1] <= k) j++;
+        const a = known[j], b = known[j + 1];
+        if (k <= a || b === undefined) return coords[a][2];
+        return coords[a][2] + (dist[k] - dist[a]) / (dist[b] - dist[a] || 1) * (coords[b][2] - coords[a][2]);
+    });
+}
+
+// Total climb and descent. A change counts only when it reaches CLIMB_THRESHOLD_M.
+function climb(eles) {
+    let up = 0, down = 0, ref = eles[0];
+    for (const e of eles) {
+        if (e - ref >= CLIMB_THRESHOLD_M) { up += e - ref; ref = e; }
+        else if (ref - e >= CLIMB_THRESHOLD_M) { down += ref - e; ref = e; }
+    }
+    return { up, down };
+}
+
+// Length, climb, and descent in meters. up and down are null if the route has no elevation.
+function routeStats(s) {
+    const coords = routeCoords(s), eles = coords.length ? elevations(coords) : [0];
+    return { meters: totalMeters(s), ...(eles ? climb(eles) : { up: null, down: null }) };
+}
+const fmtKm = m => (m / 1000).toFixed(2) + ' km';
+const fmtM = v => v === null ? '–' : Math.round(v) + ' m';
+
+// map.distance() uses the haversine formula.
+const segMeters = g => g.coords.slice(1).reduce((d, c, k) => d + map.distance(g.coords[k], c), 0);
+const totalMeters = s => allSegs(s).reduce((sum, g) => sum + segMeters(g), 0);
+
+// Pace in seconds per km, from the "m:ss" field. Returns null if the field is not valid.
+function paceSeconds() {
+    const m = $('pace').value.trim().match(/^(\d{1,2}):([0-5]\d)$/);
+    const sec = m && +m[1] * 60 + +m[2];
+    $('pace').classList.toggle('invalid', !sec);
+    return sec || null;
+}
+
+function fmtDuration(sec) {
+    const min = Math.round(sec / 60);
+    return min < 60 ? `${min} min` : `${Math.floor(min / 60)} h ${pad(min % 60)} min`;
+}
+
+// Share of trail, road, and unknown surface. The lengths of each segment are scaled to its geometry length.
+function surfaceText(s) {
+    const total = { trail: 0, road: 0, unknown: 0 };
+    for (const g of allSegs(s)) {
+        const len = segMeters(g), part = c => Number(g.surface?.[c]) || 0;
+        const sum = part('trail') + part('road') + part('unknown');
+        if (!sum) total.unknown += len;
+        else for (const c in total) total[c] += part(c) / sum * len;
+    }
+    const all = total.trail + total.road + total.unknown, pct = v => Math.round(100 * v / all);
+    if (!(total.trail + total.road)) return '';
+    return `${pct(total.trail)} % trail · ${pct(total.road)} % road`
+         + (total.unknown / all >= 0.01 ? ` · ${pct(total.unknown)} % unknown` : '');
+}
+
+function drawMeter(s) {
+    const st = routeStats(s), pace = paceSeconds(), parts = [];
+    $('meter1').textContent = `${fmtKm(st.meters)} · D+ ${fmtM(st.up)} · D- ${fmtM(st.down)}`;
+    if (s.points.length >= 2 && !s.closing) parts.push(`↩ ${fmtKm(map.distance(s.points.at(-1), s.points[0]))} to start`);
+    // ITRA km-effort: 1 km for each 100 m of climb.
+    if (pace && st.meters) parts.push('≈ ' + fmtDuration(pace * (st.meters / 1000 + (st.up ?? 0) / 100)));
+    const surface = surfaceText(s);
+    if (surface) parts.push(surface);
+    $('meter2').textContent = parts.join(' · ');
+}
+
+function drawLines(s) {
+    lineLayer.clearLayers();
+    for (const g of allSegs(s)) {
+        L.polyline(g.coords, { color: COLOR, weight: 4, interactive: false,
+                               dashArray: g.type === 'straight' ? '8 8' : null }).addTo(lineLayer);
+    }
+    drawMarks(s);
+    drawMeter(s);
+    drawProfile(s);
+}
+
+// Direction arrows every ARROW_SPACING_M meters, and km markers at each full km.
+// A km marker replaces the arrow at the same place. The marks do not catch clicks.
+function drawMarks(s) {
+    const coords = routeCoords(s), dist = cumulative(coords), total = dist.at(-1), marks = new Map();
+    if ($('arrows').checked) for (let at = ARROW_SPACING_M; at < total; at += ARROW_SPACING_M) marks.set(at, 'arrow');
+    if ($('kms').checked) for (let at = 1000; at <= total; at += 1000) marks.set(at, 'km');
+    let k = 0, screen = null;  // screen: the route on the screen, only when a km marker must move
+    for (const at of [...marks.keys()].sort((x, y) => x - y)) {
+        while (dist[k + 1] < at) k++;
+        const a = coords[k], b = coords[k + 1], t = (at - dist[k]) / (dist[k + 1] - dist[k]);
+        // The map projection keeps the angles, so the angle does not depend on the zoom level.
+        const pa = map.project(a, 0), pb = map.project(b, 0);
+        const angle = Math.atan2(pb.y - pa.y, pb.x - pa.x) * 180 / Math.PI;
+        const pos = [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])], px = map.latLngToContainerPoint(pos);
+        const onPoint = marks.get(at) === 'km'
+            && s.points.some(p => map.latLngToContainerPoint(p).distanceTo(px) < KM_CLEAR_PX);
+        screen ??= onPoint ? coords.map(c => map.latLngToContainerPoint(c)) : null;
+        const [dx, dy] = onPoint ? kmShift(px, screen) : [0, 0];
+        const icon = marks.get(at) === 'km'
+            ? L.divIcon({ className: 'km', iconSize: [20, 20], iconAnchor: [10 - dx, 10 - dy], html: String(at / 1000) })
+            : L.divIcon({ className: 'arrow', iconSize: [16, 16], html:
+                `<svg width="16" height="16" viewBox="0 0 16 16" style="transform: rotate(${angle.toFixed(1)}deg)">`
+                + `<path d="M3 2 L14 8 L3 14 L6 8 Z" fill="#fff" stroke="${COLOR}" stroke-width="1.5"`
+                + ` stroke-linejoin="round"/></svg>` });
+        L.marker(pos, { interactive: false, keyboard: false, zIndexOffset: -2000, icon }).addTo(lineLayer);
+    }
+}
+// Shift of a km marker that is on a route point: of 8 directions around the point, the one farthest from the route.
+function kmShift(px, screen) {
+    let best = [0, -KM_SHIFT_PX], bestDistance = -1;
+    for (let k = 0; k < 8; k++) {
+        const c = px.add([Math.cos(k * Math.PI / 4) * KM_SHIFT_PX, Math.sin(k * Math.PI / 4) * KM_SHIFT_PX]);
+        let d = Infinity;
+        for (let j = 1; j < screen.length; j++) d = Math.min(d, L.LineUtil.pointToSegmentDistance(c, screen[j - 1], screen[j]));
+        if (d > bestDistance) [bestDistance, best] = [d, [c.x - px.x, c.y - px.y]];
+    }
+    return best;
+}
+// The distance on the screen between a km marker and a route point changes with the zoom.
+map.on('zoomend', () => { if (!drag && !busy) drawLines(state); });
+
+// Leaflet stops a click at a marker only if the marker listens to it. Without this listener,
+// a click on a point goes to the map and adds a new point.
+const ignore = () => {};
+
+// s is the route to show. It is not always the state: at the end of a drag, it is the new route.
+function render(s = state) {
+    drawLines(s);
+    markerLayer.clearLayers();
+    s.points.forEach((p, i) => {
+        const m = L.marker(p, { draggable: !busy, icon: i === 0 ? startIcon : pointIcon }).addTo(markerLayer);
+        m.on('dragstart', () => startDrag(state));
+        m.on('drag', () => onDrag(i, m.getLatLng()));
+        m.on('dragend', () => onDragEnd(i, m));
+        m.on('dblclick', () => removePoint(i));
+        m.on('click contextmenu', ignore);
+    });
+    // A handle at the middle of each segment. A drag of the handle inserts a point.
+    allSegs(s).forEach((g, idx) => {
+        const k = idx < s.segs.length ? idx : 'closing', { p, mid } = midpoint(g.coords);
+        const h = L.marker(p, { draggable: !busy, icon: handleIcon, zIndexOffset: -1000 }).addTo(markerLayer);
+        let i;
+        // Left drag (Leaflet): straight segments. Right drag (rightDrag): routed segments.
+        const insert = type => {
+            const [base, newIndex] = withPointInserted(state, k, p, mid, type);
+            i = newIndex;
+            startDrag(base);
+            return i;
+        };
+        h.on('dragstart', () => insert('straight'));
+        h.on('drag', () => onDrag(i, h.getLatLng()));
+        h.on('dragend', () => onDragEnd(i, h));
+        h.on('click contextmenu', ignore);
+        L.DomEvent.on(h.getElement(), 'mousedown', e => {
+            if (e.button === 2 && !busy) rightDrag(e, h, () => insert('routed'));
+        });
+    });
+    const n = state.points.length;
+    $('undo').disabled = busy || !undoStack.length;
+    $('close').disabled = busy || n < 2 || !!state.closing;
+    $('reset').disabled = busy || !n;
+    $('gpx').disabled = n < 2;
+    $('homeRemove').disabled = !home;
+    $('homeSet').textContent = pickingHome ? 'Cancel' : 'Set home';
+    $('outBack').disabled = busy || n < 2 || !!state.closing;
+    const fav = favorites.find(f => f.id === favoriteId);
+    $('curName').textContent = fav ? fav.name + (dirty ? ' (modified)' : '') : n ? 'Route not saved' : 'No route';
+    $('favSave').hidden = !fav;
+    $('favSave').disabled = $('favSaveNew').disabled = busy || n < 2;
+}
+
+// Leaflet drags a marker with the left button only. This drag uses the right button.
+// start() runs at the first move of more than 3 pixels, and returns the index of the point.
+function rightDrag(down, marker, start) {
+    down.preventDefault();
+    let i = null;
+    const move = e => {
+        if (i === null && Math.hypot(e.clientX - down.clientX, e.clientY - down.clientY) <= 3) return;
+        i ??= start();
+        marker.setLatLng(map.mouseEventToLatLng(e));
+        onDrag(i, marker.getLatLng());
+    };
+    const up = e => {
+        if (e.button !== 2) return;
+        removeEventListener('mousemove', move);
+        removeEventListener('mouseup', up);
+        // On some systems, the release of the right button opens a context menu at the pointer.
+        // Block it for a short time, so that it does not add a point on the map.
+        const stop = new AbortController();
+        addEventListener('contextmenu', ev => { ev.preventDefault(); ev.stopPropagation(); },
+                         { capture: true, once: true, signal: stop.signal });
+        setTimeout(() => stop.abort(), 300);
+        if (i !== null) onDragEnd(i, marker);
+    };
+    addEventListener('mousemove', move);
+    addEventListener('mouseup', up);
+}
+
+function record() {
+    undoStack.push(JSON.stringify(state));
+    armBack();
+}
+// If localStorage is full, the route stays on the screen but is not saved.
+function saveCurrent() {
+    try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...state, favoriteId, dirty }));
+    } catch {
+        showStatus('Storage full: the route is not saved. Delete or export favorites', true);
+    }
+}
+function commit() { dirty = true; saveCurrent(); render(); }
+
+// snap: the route ends on the path, at the nearest path point to b. The caller moves its point there.
+async function fetchRoute(a, b, profile, snap = false) {
+    const url = `${BROUTER_URL}?lonlats=${a[1]},${a[0]}|${b[1]},${b[0]}`
+              + `&profile=${PROFILES[profile]}&alternativeidx=0&format=geojson`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error((await res.text()).trim() || 'HTTP ' + res.status);
+    const feature = (await res.json()).features[0];
+    const coords = feature.geometry.coordinates.map(c => [c[1], c[0], ...c.slice(2)]);
+    // BRouter gives its first and last coordinates the elevation of a node of the way, up to several
+    // hundred meters away. Remove it: the page interpolates between the nodes on each side.
+    coords[0] = coords[0].slice(0, 2);
+    coords[coords.length - 1] = coords.at(-1).slice(0, 2);
+    if (snap) b = coords.at(-1);
+    // BRouter starts and ends the route on the nearest path. Join it to the clicked points:
+    // a near clicked point replaces the end of the path, a far one gets a straight line.
+    const start = map.distance(a, coords[0]) <= JOIN_MAX_M ? coords.slice(1) : coords;
+    const middle = coords.length > 1 && map.distance(b, coords.at(-1)) <= JOIN_MAX_M ? start.slice(0, -1) : start;
+    return { coords: [a, ...middle, b], surface: surfaceOf(feature.properties.messages) };
+}
+
+// Lengths in meters per surface class, from the BRouter messages: one row per part of way, with its tags.
+function surfaceOf(messages) {
+    if (!Array.isArray(messages) || !messages.length) return undefined;
+    const [head, ...rows] = messages, iDist = head.indexOf('Distance'), iTags = head.indexOf('WayTags');
+    const out = { trail: 0, road: 0, unknown: 0 };
+    for (const row of rows) {
+        const tags = Object.fromEntries(String(row[iTags]).split(' ').map(t => t.split('=')));
+        const c = tags.surface
+            ? TRAIL_SURFACES.has(tags.surface) ? 'trail' : ROAD_SURFACES.has(tags.surface) ? 'road' : 'unknown'
+            : tags.highway ? TRAIL_HIGHWAYS.has(tags.highway) ? 'trail' : 'road' : 'unknown';
+        out[c] += Number(row[iDist]) || 0;
+    }
+    return out;
+}
+
+// A routed segment keeps its profile. Without a profile argument, the page uses the selected profile.
+async function makeSeg(type, a, b, profile = $('profile').value, snap = false) {
+    if (type !== 'routed') return { type, coords: [a, b] };
+    if (!(profile in PROFILES)) profile = DEFAULT_PROFILE;
+    return { type, profile, ...await fetchRoute(a, b, profile, snap) };
+}
+// Profile of an existing segment. A segment from before the profile choice uses the default.
+const profileOf = g => g.profile ?? DEFAULT_PROFILE;
+
+// Runs one action. Blocks other actions until it ends. On failure, the state stays as it was.
+async function run(action) {
+    busy = true;
+    armBack(true);
+    showStatus('routing...');
+    render();
+    try {
+        await action();
+        if (!statusError) showStatus('');  // keep an error from the action, for example a full storage
+    } catch (e) {
+        showStatus('Routing failed: ' + e.message, true);
+    } finally {
+        busy = false;
+        render();
+    }
+}
+
+function addPoint(latlng, type) {
+    if (busy || state.closing) return;
+    let p = [latlng.lat, latlng.lng];
+    const last = state.points.at(-1);
+    if (!last) {
+        record();
+        state.points.push(p);
+        return commit();
+    }
+    run(async () => {
+        // A right click puts the new point on the nearest path: the end of the routed segment.
+        const seg = await makeSeg(type, last, p, undefined, true);
+        p = seg.coords.at(-1);
+        record();
+        state.points.push(p);
+        state.segs.push(seg);
+        commit();
+    });
+}
+
+// Keys of the segments that touch point i: an index in segs, or 'closing'.
+function touching(s, i) {
+    const last = s.points.length - 1, keys = [];
+    if (i > 0) keys.push(i - 1);
+    if (i < last) keys.push(i);
+    if (s.closing && (i === 0 || i === last)) keys.push('closing');
+    return keys;
+}
+const getSeg = (s, k) => k === 'closing' ? s.closing : s.segs[k];
+const setSeg = (s, k, g) => k === 'closing' ? s.closing = g : s.segs[k] = g;
+const segEnds = (s, k) => k === 'closing' ? [s.points.at(-1), s.points[0]] : [s.points[k], s.points[k + 1]];
+const near = (a, b) => a && b
+    && map.latLngToContainerPoint(a).distanceTo(map.latLngToContainerPoint(b)) <= DRAG_DELTA_PX;
+
+// Copy of s with point i at p. The touching segments keep their geometry, with the ends moved to the points.
+function withPointMoved(s, i, p) {
+    const next = structuredClone(s);
+    next.points[i] = p;
+    for (const k of touching(next, i)) {
+        const g = getSeg(next, k), [a, b] = segEnds(next, k);
+        g.coords[0] = a;
+        g.coords[g.coords.length - 1] = b;
+    }
+    return next;
+}
+
+// Live drag: the lines follow the pointer at once. The routed segments update when BRouter answers.
+// To limit the load on BRouter, the page sends a request only after a pause of the pointer,
+// and only if the point moved since the last request. Only one request runs at a time.
+// drag.base is the route at the start of the drag. For an insertion, base already contains the new point.
+let drag = null;
+
+function startDrag(base) {
+    drag = { base, p: null, anchor: null, timer: null, wanted: false,
+             routedP: null, result: null, error: null, loop: null };
+}
+
+// Copy of s with a new point p in segment k, at the coordinate index mid. Returns [copy, index of p].
+// The two new segments get the given type. A routed segment split into routed segments keeps its geometry
+// for the preview. A straight segment split into routed segments uses the selected profile.
+function withPointInserted(s, k, p, mid, type) {
+    const next = structuredClone(s), g = getSeg(next, k), [a, b] = segEnds(next, k);
+    const keep = type === 'routed' && g.type === 'routed';
+    const profile = type !== 'routed' ? undefined : g.type === 'routed' ? profileOf(g) : $('profile').value;
+    const before = { type, profile, coords: keep ? [...g.coords.slice(0, mid + 1), p] : [a, p] };
+    const after = { type, profile, coords: keep ? [p, ...g.coords.slice(mid + 1)] : [p, b] };
+    if (k === 'closing') {
+        next.points.push(p);
+        next.segs.push(before);
+        next.closing = after;
+        return [next, next.points.length - 1];
+    }
+    next.points.splice(k + 1, 0, p);
+    next.segs.splice(k, 1, before, after);
+    return [next, k + 1];
+}
+
+function onDrag(i, latlng) {
+    const d = drag;
+    d.p = [latlng.lat, latlng.lng];
+    drawLines(withPointMoved(d.result ?? d.base, i, d.p));
+    if (near(d.p, d.anchor)) return;
+    d.anchor = d.p;
+    clearTimeout(d.timer);
+    d.timer = setTimeout(() => requestDragRoute(i, d), DRAG_PAUSE_MS);
+}
+
+function requestDragRoute(i, d) {
+    d.wanted = true;
+    d.loop ??= routeDrag(i, d).finally(() => d.loop = null);
+    return d.loop;
+}
+
+async function routeDrag(i, d) {
+    while (d.wanted) {
+        d.wanted = false;
+        const p = d.p;
+        if (near(d.routedP, p)) continue;
+        const next = withPointMoved(d.base, i, p);
+        try {
+            await Promise.all(touching(next, i).map(async k =>
+                setSeg(next, k, await makeSeg(getSeg(next, k).type, ...segEnds(next, k), profileOf(getSeg(next, k))))));
+            d.result = next;
+            d.error = null;
+        } catch (e) {
+            d.error = e;
+        }
+        d.routedP = p;
+        if (drag === d) drawLines(withPointMoved(d.result ?? d.base, i, d.p));
+    }
+}
+
+async function onDragEnd(i, marker) {
+    const d = drag;
+    drag = null;
+    clearTimeout(d.timer);
+    d.p = [marker.getLatLng().lat, marker.getLatLng().lng];
+    // A hand moves a few pixels during a click or a double-click. Ignore such a drag:
+    // put the marker back and keep the same marker elements, so that a double-click still works.
+    if (near(d.p, d.base.points[i])) {
+        marker.setLatLng(d.base.points[i]);
+        return drawLines(state);
+    }
+    busy = true;
+    armBack(true);
+    showStatus('routing...');
+    render(withPointMoved(d.result ?? d.base, i, d.p));
+    await requestDragRoute(i, d);
+    busy = false;
+    if (d.error) {
+        showStatus('Routing failed: ' + d.error.message, true);
+        return render();
+    }
+    showStatus('');
+    record();
+    state = withPointMoved(d.result, i, d.p);
+    commit();
+}
+
+function removePoint(i) {
+    if (busy) return;
+    run(async () => {
+        const next = structuredClone(state), pts = next.points, last = pts.length - 1;
+        if (i > 0 && i < last) {
+            // The new segment takes the type of the segment that arrived at the removed point.
+            next.segs.splice(i - 1, 2, await makeSeg(next.segs[i - 1].type, pts[i - 1], pts[i + 1], profileOf(next.segs[i - 1])));
+        } else {
+            next.segs.splice(i === 0 ? 0 : i - 1, 1);
+        }
+        pts.splice(i, 1);
+        if (next.closing && pts.length < 2) next.closing = null;
+        else if (next.closing && (i === 0 || i === last)) next.closing = await makeSeg('routed', pts.at(-1), pts[0], profileOf(next.closing));
+        record();
+        state = next;
+        commit();
+    });
+}
+
+map.on('click', e => pickingHome ? setHome([e.latlng.lat, e.latlng.lng]) : addPoint(e.latlng, 'straight'));
+map.on('contextmenu', e => addPoint(e.latlng, 'routed'));  // Leaflet blocks the browser menu
+
+function undo() {
+    if (busy || !undoStack.length) return;
+    state = JSON.parse(undoStack.pop());
+    commit();
+}
+$('undo').onclick = undo;
+
+// Home (SPEC.md section 4.1). The home is not part of the route: undo and reset do not change it.
+function setHome(p) {
+    pickingHome = false;
+    home = p;
+    if (p) {
+        localStorage.setItem(HOME_KEY, JSON.stringify(p));
+        homeMarker.setLatLng(p).addTo(map);
+    } else {
+        localStorage.removeItem(HOME_KEY);
+        homeMarker.remove();
+    }
+    showStatus('');
+    render();
+}
+$('homeSet').onclick = () => {
+    pickingHome = !pickingHome;
+    showStatus(pickingHome ? 'Click on the map to set the home' : '');
+    render();
+};
+$('homeRemove').onclick = () => setHome(null);
+
+// The Back button of the browser or of the mouse runs Undo. While there is something to undo,
+// the page keeps one extra history entry. Back removes it: the page runs Undo and adds it again.
+// When there is nothing to undo, Back goes to the previous page.
+let backArmed = false;
+// force: add the entry even with an empty undo history (while a routing request runs, Back must do nothing).
+function armBack(force = false) {
+    if (backArmed || (!force && !undoStack.length)) return;
+    history.pushState({ tracemap: 'undo' }, '');
+    backArmed = true;
+}
+addEventListener('popstate', () => {
+    backArmed = false;
+    if (busy) return armBack(true);
+    if (!undoStack.length) return history.back();
+    undo();
+    armBack();
+});
+
+// Adds the same route back to the start: copies of the points and segments, in the reverse order.
+$('outBack').onclick = () => {
+    if (busy || state.points.length < 2 || state.closing) return;
+    record();
+    const back = [...state.segs].reverse().map(g => {
+        const c = structuredClone(g);
+        c.coords.reverse();
+        return c;
+    });
+    state.points.push(...state.points.slice(0, -1).reverse().map(p => [...p]));
+    state.segs.push(...back);
+    commit();
+};
+
+$('close').onclick = () => run(async () => {
+    const seg = await makeSeg('routed', state.points.at(-1), state.points[0]);
+    record();
+    state.closing = seg;
+    commit();
+});
+
+// First click asks for confirmation in the button. A second click within 3 seconds resets.
+// The page does not use confirm(): some browsers block it and it then returns false.
+let resetTimer;
+$('reset').onclick = () => {
+    if (!state.points.length) return;
+    if (!resetTimer) {
+        $('reset').textContent = 'Confirm reset?';
+        resetTimer = setTimeout(() => { resetTimer = null; $('reset').textContent = 'Reset'; }, 3000);
+        return;
+    }
+    clearTimeout(resetTimer);
+    resetTimer = null;
+    $('reset').textContent = 'Reset';
+    state = { points: [], segs: [], closing: null };
+    undoStack = [];
+    favoriteId = null;
+    dirty = false;
+    importedName = '';
+    localStorage.removeItem(STORAGE_KEY);
+    render();
+    renderFavorites();
+};
+
+$('gpx').onclick = () => {
+    const coords = routeCoords(state), eles = elevations(coords);
+    // A route from a favorite uses the favorite name, for the file and for the track.
+    const name = favorites.find(f => f.id === favoriteId)?.name;
+    const xmlName = (name ?? 'TraceMap').replace(/[&<>"]/g, c => `&#${c.charCodeAt(0)};`);
+    const fileName = name ? name.replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').trim() : 'tracemap';
+    const gpx = `<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="TraceMap" xmlns="http://www.topografix.com/GPX/1/1">
+<trk><name>${xmlName}</name><trkseg>
+${coords.map(([lat, lon], k) => `<trkpt lat="${lat.toFixed(6)}" lon="${lon.toFixed(6)}">`
+             + (eles ? `<ele>${eles[k].toFixed(1)}</ele>` : '') + '</trkpt>').join('\n')}
+</trkseg></trk>
+</gpx>
+`;
+    const d = new Date();
+    download(`${fileName}-${ymd(d)}-${pad(d.getHours())}${pad(d.getMinutes())}.gpx`, gpx, 'application/gpx+xml');
+};
+
+const pad = v => String(v).padStart(2, '0');
+const ymd = d => `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`;
+const dmy = d => `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()}`;
+
+// ---- GPX import (SPEC.md section 8.6)
+
+// Route from a GPX file: the full track geometry, with a route point every IMPORT_POINT_SPACING_M meters.
+// Each part between two route points is a routed segment, so that a move of a point recalculates it.
+function routeFromGpx(text) {
+    const doc = new DOMParser().parseFromString(text, 'application/xml');
+    if (doc.querySelector('parsererror')) throw new Error('the file is not valid GPX');
+    let nodes = [...doc.getElementsByTagName('trkpt')];
+    if (!nodes.length) nodes = [...doc.getElementsByTagName('rtept')];
+    const coords = [];
+    for (const n of nodes) {
+        const lat = Number(n.getAttribute('lat')), lon = Number(n.getAttribute('lon'));
+        const e = n.getElementsByTagName('ele')[0]?.textContent.trim(), ele = e ? Number(e) : NaN;
+        const prev = coords.at(-1);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon) || (prev && prev[0] === lat && prev[1] === lon)) continue;
+        coords.push(Number.isFinite(ele) ? [lat, lon, ele] : [lat, lon]);
+    }
+    // A GPX file from an older TraceMap version has a detour at each route point: A on the path, the clicked
+    // point, A again, with two wrong elevations. Keep one A, without elevation: the page interpolates it.
+    // A longer detour is a real out and back (for example to the end of a dead end): keep it.
+    for (let k = coords.length - 2; k >= 1; k--) {
+        const a = coords[k - 1], c = coords[k + 1];
+        if (c && a[0] === c[0] && a[1] === c[1] && map.distance(a, coords[k]) <= DETOUR_MAX_M) {
+            coords.splice(k, 2);
+            coords[k - 1] = a.slice(0, 2);
+        }
+    }
+    if (coords.length < 2) throw new Error('the file has fewer than 2 track points');
+    // Cut at each full IMPORT_POINT_SPACING_M, but not just before the end: the last segment is not too short.
+    const dist = cumulative(coords), cuts = [0];
+    let next = IMPORT_POINT_SPACING_M;
+    for (let k = 1; k < coords.length - 1; k++) {
+        if (dist[k] < next) continue;
+        while (next <= dist[k]) next += IMPORT_POINT_SPACING_M;
+        if (dist.at(-1) - dist[k] >= IMPORT_POINT_SPACING_M / 4) cuts.push(k);
+    }
+    cuts.push(coords.length - 1);
+    const points = cuts.map(k => [coords[k][0], coords[k][1]]);
+    const segs = cuts.slice(1).map((k, j) => ({ type: 'routed', profile: DEFAULT_PROFILE,
+                                                coords: coords.slice(cuts[j], k + 1) }));
+    const name = doc.querySelector('trk > name') ?? doc.querySelector('metadata > name') ?? doc.querySelector('rte > name');
+    return { route: { points, segs, closing: null }, name: name?.textContent.trim() ?? '' };
+}
+
+// If the route is unsaved, the first click asks for confirmation in the button. A second click opens the file selection.
+let importTimer;
+$('gpxImport').onclick = () => {
+    if (busy) return;
+    if (state.points.length && dirty && !importTimer) {
+        $('gpxImport').textContent = 'Replace the unsaved route?';
+        importTimer = setTimeout(() => { importTimer = null; $('gpxImport').textContent = 'Import GPX'; }, 3000);
+        return;
+    }
+    clearTimeout(importTimer);
+    importTimer = null;
+    $('gpxImport').textContent = 'Import GPX';
+    $('gpxFile').click();
+};
+
+$('gpxFile').onchange = async e => {
+    const file = e.target.files[0];
+    e.target.value = '';  // so that the same file can be selected again
+    if (!file || busy) return;
+    let imported;
+    try {
+        imported = routeFromGpx(await file.text());
+    } catch (err) {
+        return showStatus('Import failed: ' + err.message, true);
+    }
+    state = imported.route;
+    undoStack = [];
+    favoriteId = null;
+    dirty = true;
+    importedName = imported.name;
+    saveCurrent();
+    render();
+    renderFavorites();
+    fitRoute(state, true);
+    showStatus(`Imported ${fmtKm(totalMeters(state))} with ${state.points.length} points`, false, true);
+};
+
+function download(name, text, type) {
+    const a = document.createElement('a');
+    a.download = name;
+    a.href = URL.createObjectURL(new Blob([text], { type }));
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+$('search').onsubmit = async e => {
+    e.preventDefault();
+    const q = e.target.q.value.trim();
+    if (!q) return;
+    try {
+        const res = await fetch(`${NOMINATIM_URL}?format=json&limit=1&q=${encodeURIComponent(q)}`);
+        const [hit] = await res.json();
+        if (!hit) return showStatus('No result', true);
+        const [south, north, west, east] = hit.boundingbox.map(Number);
+        map.fitBounds([[south, west], [north, east]]);
+    } catch (err) {
+        showStatus('Search failed: ' + err.message, true);
+    }
+};
+
+function isRoute(s) {
+    const isPt = p => Array.isArray(p) && p.length === 2 && p.every(Number.isFinite);
+    const isCoord = c => Array.isArray(c) && (c.length === 2 || c.length === 3) && c.every(Number.isFinite);
+    const isSeg = g => g && ['routed', 'straight'].includes(g.type)
+                     && Array.isArray(g.coords) && g.coords.length >= 2 && g.coords.every(isCoord);
+    return !!s && Array.isArray(s.points) && s.points.every(isPt)
+        && Array.isArray(s.segs) && s.segs.length === Math.max(0, s.points.length - 1) && s.segs.every(isSeg)
+        && (s.closing === null || (s.points.length >= 2 && isSeg(s.closing)));
+}
+const routeOf = s => ({ points: s.points, segs: s.segs, closing: s.closing });
+const fitRoute = (s, animate) => map.fitBounds(L.latLngBounds(routeCoords(s).concat(s.points)),
+                                               { padding: [30, 30], maxZoom: START_ZOOM + 2, animate });
+
+// Routes saved before the elevation fix: at a junction of two routed segments, the end of the first and the
+// start of the second are the same path location, with two different (wrong) elevations. Remove both:
+// the page interpolates them. Same elevations mean nothing to fix (for example an out and back).
+function cleanJunctions(route) {
+    const segs = allSegs(route), pairs = segs.slice(1).map((g, k) => [segs[k], g]);
+    if (route.closing) pairs.push([route.closing, route.segs[0]]);
+    for (const [first, second] of pairs) {
+        if (first?.type !== 'routed' || second?.type !== 'routed' || first.coords.length < 3 || second.coords.length < 3) continue;
+        const end = first.coords.at(-2), start = second.coords[1];
+        if (end[0] !== start[0] || end[1] !== start[1] || end[2] === start[2]) continue;
+        first.coords[first.coords.length - 2] = end.slice(0, 2);
+        second.coords[1] = start.slice(0, 2);
+    }
+    return route;
+}
+
+function loadSaved() {
+    try {
+        const s = JSON.parse(localStorage.getItem(STORAGE_KEY));
+        if (!isRoute(s)) return;
+        state = cleanJunctions(routeOf(s));
+        favoriteId = typeof s.favoriteId === 'string' ? s.favoriteId : null;
+        // A route from before the favorites has no dirty flag: if it has points, it is unsaved.
+        dirty = typeof s.dirty === 'boolean' ? s.dirty : s.points.length > 0;
+        if (s.points.length) fitRoute(state, false);
+    } catch {
+        // Not valid JSON: start with an empty route.
+    }
+}
+
+// ---- Favorites (SPEC.md section 10)
+
+const isFavorite = f => f && typeof f.id === 'string' && typeof f.name === 'string' && f.name.trim()
+                     && !isNaN(Date.parse(f.savedAt)) && isRoute(f.route) && f.route.points.length >= 2;
+const newId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+const fold = t => t.normalize('NFD').replace(/\p{Diacritic}/gu, '').toLowerCase();
+
+function loadFavorites() {
+    try {
+        const list = JSON.parse(localStorage.getItem(FAVORITES_KEY));
+        favorites = Array.isArray(list) ? list.filter(isFavorite) : [];
+        favorites.forEach(f => cleanJunctions(f.route));
+    } catch {
+        favorites = [];
+    }
+}
+
+// Saves the list. If localStorage is full, the list stays as it was and the function returns false.
+function writeFavorites(list) {
+    try {
+        localStorage.setItem(FAVORITES_KEY, JSON.stringify(list));
+    } catch {
+        showStatus('Storage full: delete or export favorites', true);
+        return false;
+    }
+    favorites = list;
+    return true;
+}
+
+// SVG drawing of the route line. The horizontal scale uses the cosine of the latitude.
+function thumbnail(s) {
+    const W = 96, H = 64, M = 4, all = routeCoords(s);
+    const step = Math.ceil(all.length / 200), coords = all.filter((c, k) => k % step === 0 || k === all.length - 1);
+    const kx = Math.cos(coords[0][0] * Math.PI / 180);
+    const xs = coords.map(c => c[1] * kx), ys = coords.map(c => -c[0]);
+    const minX = Math.min(...xs), minY = Math.min(...ys), w = Math.max(...xs) - minX, h = Math.max(...ys) - minY;
+    const scale = Math.min((W - 2 * M) / (w || 1e-9), (H - 2 * M) / (h || 1e-9));
+    const ox = (W - w * scale) / 2, oy = (H - h * scale) / 2;
+    const pts = xs.map((x, k) => `${((x - minX) * scale + ox).toFixed(1)},${((ys[k] - minY) * scale + oy).toFixed(1)}`);
+    const [sx, sy] = pts[0].split(',');
+    return `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"><rect width="${W}" height="${H}" fill="#f4f4f4"/>`
+         + `<polyline points="${pts.join(' ')}" fill="none" stroke="${COLOR}" stroke-width="2" stroke-linejoin="round"/>`
+         + `<circle cx="${sx}" cy="${sy}" r="3" fill="#2e7d32"/></svg>`;
+}
+
+function renderFavorites() {
+    if ($('favs').hidden) return;
+    const q = fold($('favSearch').value.trim());
+    const list = favorites.filter(f => fold(f.name).includes(q)).sort((a, b) => b.savedAt.localeCompare(a.savedAt));
+    $('favList').replaceChildren(...list.map(favItem));
+    if (!list.length) $('favList').textContent = favorites.length ? 'No favorite matches the search' : 'No favorite yet';
+}
+
+function favItem(f) {
+    const item = document.createElement('div');
+    item.className = 'fav' + (f.id === favoriteId ? ' current' : '');
+    const { meters, up } = routeStats(f.route);
+    item.innerHTML = thumbnail(f.route) + `
+        <div><div class="name"></div><div class="meta">${fmtKm(meters)} · D+ ${fmtM(up)}</div>
+             <div class="meta">${dmy(new Date(f.savedAt))}${f.route.closing ? ' ↻' : ''}</div></div>
+        <div class="actions"><button class="rename" title="Rename">✎</button><button class="delete" title="Delete">🗑</button></div>
+        <div class="confirm" hidden>Replace the unsaved route?
+             <button class="replace">Replace</button><button class="cancel">Cancel</button></div>`;
+    const name = item.querySelector('.name');
+    name.textContent = f.name;  // textContent: a name can come from an imported file
+    const confirmBar = item.querySelector('.confirm');
+    const open = () => {
+        if (busy) return;
+        if (state.points.length && dirty) confirmBar.hidden = false;
+        else loadFavorite(f);
+    };
+    item.querySelector('svg').onclick = open;
+    name.onclick = open;
+    item.querySelector('.replace').onclick = () => loadFavorite(f);
+    item.querySelector('.cancel').onclick = () => confirmBar.hidden = true;
+    item.querySelector('.rename').onclick = () => renameFavorite(f, name);
+    const del = item.querySelector('.delete');
+    let delTimer;
+    del.onclick = () => {
+        if (!delTimer) {
+            del.textContent = 'Delete?';
+            delTimer = setTimeout(() => { delTimer = null; del.textContent = '🗑'; }, 3000);
+            return;
+        }
+        clearTimeout(delTimer);
+        deleteFavorite(f);
+    };
+    return item;
+}
+
+function loadFavorite(f) {
+    if (busy) return;
+    state = structuredClone(f.route);
+    undoStack = [];
+    favoriteId = f.id;
+    dirty = false;
+    importedName = '';
+    saveCurrent();
+    render();
+    renderFavorites();
+    fitRoute(state, true);
+}
+
+function saveFavorite(name) {
+    // The name field can stay open while the user removes points.
+    if (state.points.length < 2) return showStatus('A favorite needs at least 2 points', true);
+    const route = structuredClone(state), savedAt = new Date().toISOString();
+    const old = favorites.find(f => f.id === favoriteId);
+    const fav = name === undefined ? { ...old, savedAt, route } : { id: newId(), name, savedAt, route };
+    if (!writeFavorites([...favorites.filter(f => f.id !== fav.id), fav])) return;
+    favoriteId = fav.id;
+    dirty = false;
+    importedName = '';
+    saveCurrent();
+    render();
+    renderFavorites();
+}
+
+function renameFavorite(f, nameEl) {
+    const input = document.createElement('input');
+    input.value = f.name;
+    input.maxLength = 100;
+    nameEl.replaceWith(input);
+    input.focus();
+    input.select();
+    let done = false;
+    const finish = keep => {
+        if (done) return;
+        done = true;
+        const name = input.value.trim();
+        if (keep && name && name !== f.name) {
+            writeFavorites(favorites.map(g => g.id === f.id ? { ...g, name } : g));
+            render();
+        } else if (keep && !name) {
+            showStatus('The name cannot be empty', true);
+        }
+        input.replaceWith(nameEl);
+        renderFavorites();
+    };
+    input.onkeydown = e => {
+        if (e.key === 'Enter') finish(true);
+        if (e.key === 'Escape') finish(false);
+    };
+    input.onblur = () => finish(true);
+}
+
+function deleteFavorite(f) {
+    if (!writeFavorites(favorites.filter(g => g.id !== f.id))) return;
+    if (f.id === favoriteId) {
+        favoriteId = null;
+        dirty = true;
+        saveCurrent();
+    }
+    render();
+    renderFavorites();
+}
+
+// The Favorites button opens the panel and hides itself. The ✕ button closes the panel and shows it again.
+// The page keeps the state of the panel, for the next page load.
+const FAVS_OPEN_KEY = 'tracemap.favoritesOpen';
+function showFavorites(open) {
+    $('favs').hidden = !open;
+    $('favOpen').hidden = open;
+    localStorage.setItem(FAVS_OPEN_KEY, open ? 'on' : 'off');
+    renderFavorites();
+}
+$('favOpen').onclick = () => showFavorites(true);
+$('favClose').onclick = () => showFavorites(false);
+$('favSearch').oninput = renderFavorites;
+$('favSave').onclick = () => saveFavorite();
+$('favSaveNew').onclick = () => {
+    const d = new Date();
+    $('nameInput').value = importedName || `Route ${dmy(d)} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    $('nameForm').hidden = false;
+    $('nameInput').focus();
+    $('nameInput').select();
+};
+$('nameForm').onsubmit = e => {
+    e.preventDefault();
+    const name = $('nameInput').value.trim();
+    if (!name) return showStatus('The name cannot be empty', true);
+    $('nameForm').hidden = true;
+    saveFavorite(name);
+};
+$('nameCancel').onclick = () => $('nameForm').hidden = true;
+$('nameInput').onkeydown = e => { if (e.key === 'Escape') $('nameForm').hidden = true; };
+
+$('favExport').onclick = () => download(`tracemap-favorites-${ymd(new Date())}.json`,
+    JSON.stringify({ app: 'tracemap', version: 1, favorites }, null, 1), 'application/json');
+$('favImport').onclick = () => $('favFile').click();
+$('favFile').onchange = async e => {
+    const file = e.target.files[0];
+    e.target.value = '';  // so that the same file can be selected again
+    if (!file) return;
+    let data;
+    try {
+        data = JSON.parse(await file.text());
+    } catch {
+        return showStatus('Import failed: the file is not valid JSON', true);
+    }
+    if (!data || data.app !== 'tracemap' || !Array.isArray(data.favorites)) {
+        return showStatus('Import failed: this is not a TraceMap favorites file', true);
+    }
+    const list = [...favorites];
+    let added = 0, updated = 0, ignored = 0;
+    for (const raw of data.favorites) {
+        const f = isFavorite(raw) && { id: raw.id, name: raw.name.trim(),
+                                       savedAt: new Date(raw.savedAt).toISOString(), route: cleanJunctions(routeOf(raw.route)) };
+        const k = f ? list.findIndex(g => g.id === f.id) : -2;
+        if (k === -2) ignored++;
+        else if (k === -1) { list.push(f); added++; }
+        else if (Date.parse(f.savedAt) > Date.parse(list[k].savedAt)) { list[k] = f; updated++; }
+        else ignored++;
+    }
+    if (!writeFavorites(list)) return;
+    render();
+    renderFavorites();
+    showStatus(`${added} added, ${updated} updated, ${ignored} ignored`, false, true);
+};
+
+// ---- Elevation profile (SPEC.md section 7.5)
+
+// Colors of the area below the curve. Each slope class has one color: below 5 %, 5 to 10 %, above 10 %.
+// Near a limit, the color blends over SLOPE_BLEND % on each side. One blue hue, light to dark,
+// checked for color blindness.
+const SLOPE_LIMITS = [5, 10], SLOPE_COLORS = ['#86b6ef', '#2a78d6', '#104281'], SLOPE_BLEND = 1;
+// [absolute slope in %, color]: between two stops, the color is a linear interpolation.
+const SLOPE_STOPS = SLOPE_LIMITS.flatMap((v, i) => [[v - SLOPE_BLEND, SLOPE_COLORS[i]], [v + SLOPE_BLEND, SLOPE_COLORS[i + 1]]]);
+const SLOPE_LEGEND_MAX = 15;
+
+// Color for a slope: linear interpolation in RGB between the two nearest stops.
+function slopeColor(slope) {
+    const v = Math.abs(slope), rgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+    const k = SLOPE_STOPS.findIndex(([at]) => v < at);
+    if (k === 0) return SLOPE_STOPS[0][1];
+    if (k === -1) return SLOPE_STOPS.at(-1)[1];
+    const [a, ca] = SLOPE_STOPS[k - 1], [b, cb] = SLOPE_STOPS[k], t = (v - a) / (b - a);
+    const [x, y] = [rgb(ca), rgb(cb)];
+    return '#' + x.map((c, i) => Math.round(c + t * (y[i] - c)).toString(16).padStart(2, '0')).join('');
+}
+const PROFILE_H = 150, PAD = { left: 44, right: 10, top: 20, bottom: 18 };
+let profile = null;  // the last drawn chart: samples and scales, for the hover
+let profileRoute = null, profileFrame = 0;
+// The linked dots on the map and on the chart: red, to stand out from the blue route and chart.
+const HOVER_COLOR = '#d03b3b';
+// The map dot is in its own pane, above the points, handles, arrows, and km markers (marker pane: 600).
+map.createPane('hover').style.zIndex = 690;
+const hoverDot = L.circleMarker([0, 0], { radius: 7, color: '#fff', weight: 2, fillColor: HOVER_COLOR,
+                                          fillOpacity: 1, interactive: false, pane: 'hover' });
+
+// n samples at regular distances along the route, with elevation, slope over about 50 m, and location.
+// Returns null if the route has no elevation.
+function profileSamples(s, n) {
+    const coords = routeCoords(s), eles = coords.length > 1 ? elevations(coords) : null;
+    if (!eles) return null;
+    const dist = cumulative(coords), total = dist.at(-1);
+    if (!total) return null;
+    const samples = [];
+    let k = 0;
+    for (let j = 0; j < n; j++) {
+        const at = total * j / (n - 1);
+        while (k < coords.length - 2 && dist[k + 1] < at) k++;
+        const a = coords[k], b = coords[k + 1], t = (at - dist[k]) / (dist[k + 1] - dist[k] || 1);
+        samples.push({ at, ele: eles[k] + t * (eles[k + 1] - eles[k]), known: a.length > 2 && b.length > 2,
+                       latlng: [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])] });
+    }
+    // Slope over 50 m (25 m before and after), from the full route geometry, at any sample spacing.
+    const eleAt = d => {
+        let lo = 0, hi = coords.length - 1;
+        while (hi - lo > 1) { const m = (lo + hi) >> 1; if (dist[m] <= d) lo = m; else hi = m; }
+        return eles[lo] + (d - dist[lo]) / (dist[hi] - dist[lo] || 1) * (eles[hi] - eles[lo]);
+    };
+    for (const p of samples) {
+        const a = Math.max(0, p.at - 25), b = Math.min(total, p.at + 25);
+        p.slope = (eleAt(b) - eleAt(a)) / (b - a) * 100;
+    }
+    return { samples, total, coords, dist };
+}
+
+// Redraws at most once per screen frame: a drag calls drawLines for each pointer move.
+function drawProfile(s) {
+    profileRoute = s;
+    profileFrame ||= requestAnimationFrame(() => {
+        profileFrame = 0;
+        renderProfile(profileRoute);
+    });
+}
+
+function renderProfile(s) {
+    const box = $('elevProfile');
+    box.hidden = !$('elevation').checked || s.points.length < 2;
+    const W = box.clientWidth, H = PROFILE_H;
+    const data = !box.hidden && profileSamples(s, Math.max(2, W - PAD.left - PAD.right));
+    if (!data) {
+        box.hidden = true;
+        profile = null;
+        return hideHover();
+    }
+    const { samples, total } = data, eles = samples.map(p => p.ele);
+    const lo = Math.floor(Math.min(...eles) / 10) * 10, hi = Math.max(Math.ceil(Math.max(...eles) / 10) * 10, lo + 20);
+    const x = d => PAD.left + d / total * (W - PAD.left - PAD.right);
+    const y = e => PAD.top + (hi - e) / (hi - lo) * (H - PAD.top - PAD.bottom);
+    const base = H - PAD.bottom, xy = p => `${x(p.at).toFixed(1)},${y(p.ele).toFixed(1)}`;
+    let svg = '';
+    // Gridlines and elevation labels
+    for (const e of [lo, hi]) {
+        svg += `<line x1="${PAD.left}" x2="${W - PAD.right}" y1="${y(e)}" y2="${y(e)}" stroke="#e1e0d9"/>`
+             + `<text x="${PAD.left - 4}" y="${y(e) + 4}" text-anchor="end" fill="#898781">${e} m</text>`;
+    }
+    // Area below the curve: one shape, filled with a horizontal gradient that follows the slope.
+    // The parts with interpolated elevation also get the color of their (estimated) slope.
+    const every = Math.max(1, Math.ceil(samples.length / 600)), stops = [];
+    for (let j = 0; j < samples.length; j += every) stops.push(j);
+    if (stops.at(-1) !== samples.length - 1) stops.push(samples.length - 1);
+    const gradient = stops.map(j => `<stop offset="${(samples[j].at / total).toFixed(4)}" stop-color="${slopeColor(samples[j].slope)}"/>`);
+    const legendStops = [0, ...SLOPE_STOPS.map(([at]) => at), SLOPE_LEGEND_MAX]
+        .map(at => `<stop offset="${at / SLOPE_LEGEND_MAX}" stop-color="${slopeColor(at)}"/>`);
+    svg += `<defs><linearGradient id="pfFill" gradientUnits="userSpaceOnUse" x1="${x(0)}" x2="${x(total)}" y1="0" y2="0">`
+         + gradient.join('') + `</linearGradient><linearGradient id="pfLegend">${legendStops.join('')}</linearGradient></defs>`
+         + `<path d="M${samples.map(xy).join('L')}L${x(total)},${base}L${x(0)},${base}Z" fill="url(#pfFill)"/>`;
+    // Line: dark blue where the elevation is real, gray dashes where it is interpolated
+    const parts = [];
+    for (let j = 0; j < samples.length - 1; j++) {
+        const known = samples[j].known && samples[j + 1].known;
+        if (parts.at(-1)?.known !== known) parts.push({ known, pts: [samples[j]] });
+        parts.at(-1).pts.push(samples[j + 1]);
+    }
+    for (const { known, pts } of parts) {
+        svg += `<path d="M${pts.map(xy).join('L')}" fill="none" stroke="${known ? '#0d366b' : '#898781'}"`
+             + ` stroke-width="2" stroke-linejoin="round" ${known ? 'stroke-linecap="round"' : 'stroke-dasharray="4 3"'}/>`;
+    }
+    // Distance ticks
+    const step = total <= 15000 ? 1000 : total <= 30000 ? 2000 : 5000;
+    for (let at = 0; at <= total; at += step) {
+        svg += `<text x="${x(at)}" y="${H - 4}" text-anchor="middle" fill="#898781">${at / 1000}${at ? '' : ' km'}</text>`;
+    }
+    // Legend of the slope colors, at the top right: a gradient bar from 0 % to SLOPE_LEGEND_MAX %
+    const lx = W - PAD.right - 150;
+    svg += `<text x="${lx - 4}" y="13" text-anchor="end" fill="#898781">Slope 0 %</text>`
+         + `<rect x="${lx}" y="5" width="110" height="8" fill="url(#pfLegend)"/>`
+         + `<text x="${lx + 114}" y="13" fill="#898781">${SLOPE_LEGEND_MAX} %+</text>`;
+    // Hover layer
+    svg += `<line id="pfCross" y1="${PAD.top}" y2="${base}" stroke="#52514e" visibility="hidden"/>`
+         + `<circle id="pfDot" r="6" fill="${HOVER_COLOR}" stroke="#fcfcfb" stroke-width="2" visibility="hidden"/>`;
+    const el = $('profileSvg');
+    el.setAttribute('width', W);
+    el.setAttribute('height', H);
+    el.innerHTML = svg;  // numbers and fixed labels only
+    profile = { samples, x, y, W, total, coords: data.coords, dist: data.dist };
+}
+
+// onMap false: the chart shows the location, but the map shows no red dot (the pointer is on a point or a handle).
+// latlng: where to put the map dot. By default, the location of the sample.
+function showHover(j, onMap = true, latlng = null) {
+    const p = profile.samples[j], cx = profile.x(p.at).toFixed(1), cy = profile.y(p.ele).toFixed(1);
+    const cross = $('pfCross'), dot = $('pfDot'), tip = $('profileTip');
+    cross.setAttribute('x1', cx);
+    cross.setAttribute('x2', cx);
+    dot.setAttribute('cx', cx);
+    dot.setAttribute('cy', cy);
+    cross.setAttribute('visibility', 'visible');
+    dot.setAttribute('visibility', 'visible');
+    const slope = ` · ${p.known ? '' : '≈ '}${p.slope >= 0 ? '+' : ''}${Math.round(p.slope)} %`;
+    tip.innerHTML = `<b>${Math.round(p.ele)} m</b> · ${fmtKm(p.at)}${slope}`;  // numbers only
+    tip.hidden = false;
+    tip.style.left = Math.min(Math.max(0, cx - tip.offsetWidth / 2), profile.W - tip.offsetWidth) + 'px';
+    if (onMap) hoverDot.setLatLng(latlng ?? p.latlng).addTo(map);
+    else hoverDot.remove();
+}
+
+function hideHover() {
+    $('profileTip').hidden = true;
+    $('pfCross')?.setAttribute('visibility', 'hidden');
+    $('pfDot')?.setAttribute('visibility', 'hidden');
+    hoverDot.remove();
+}
+
+// Sample under the pointer on the chart
+function sampleAt(e) {
+    const n = profile.samples.length, inner = profile.W - PAD.left - PAD.right;
+    return Math.min(n - 1, Math.max(0, Math.round((e.offsetX - PAD.left) / inner * (n - 1))));
+}
+$('profileSvg').addEventListener('mousemove', e => profile && showHover(sampleAt(e)));
+$('profileSvg').addEventListener('mouseleave', hideHover);
+$('profileSvg').addEventListener('click', e => profile && map.panTo(profile.samples[sampleAt(e)].latlng));
+
+// Pointer near the route on the map: the chart shows the same location. Clicks on the map do not change.
+// This is a DOM listener: Leaflet does not send to the map the moves over a point or a handle.
+// Over a point or a handle, the chart still follows, but the map shows no red dot on top of it.
+map.getContainer().addEventListener('mousemove', e => {
+    if (!profile || drag || e.target.closest('.leaflet-control')) return;
+    // The nearest location on the route line, within 12 pixels
+    const pt = map.mouseEventToContainerPoint(e), { coords, dist, total, samples } = profile;
+    const screen = coords.map(c => map.latLngToContainerPoint(c));
+    let best = -1, bestD = 12;
+    for (let k = 1; k < screen.length; k++) {
+        const d = L.LineUtil.pointToSegmentDistance(pt, screen[k - 1], screen[k]);
+        if (d < bestD) { bestD = d; best = k; }
+    }
+    if (best < 0) return hideHover();
+    const a = screen[best - 1], b = screen[best], c = L.LineUtil.closestPointOnSegment(pt, a, b);
+    const t = a.distanceTo(b) ? a.distanceTo(c) / a.distanceTo(b) : 0;
+    const at = dist[best - 1] + t * (dist[best] - dist[best - 1]);
+    showHover(Math.round(at / total * (samples.length - 1)), !e.target.closest('.point, .handle'),
+              map.containerPointToLatLng(c));
+});
+map.on('mouseout', hideHover);
+addEventListener('resize', () => drawProfile(state));
+
+// ---- User choices, kept in localStorage
+
+function keepChoice(id, onChange) {
+    const el = $(id), key = 'tracemap.' + id, isBox = el.type === 'checkbox', saved = localStorage.getItem(key);
+    if (saved !== null && isBox) el.checked = saved === 'on';
+    else if (saved !== null) el.value = saved;
+    el.addEventListener(isBox ? 'change' : 'input', () => {
+        localStorage.setItem(key, isBox ? (el.checked ? 'on' : 'off') : el.value);
+        onChange();
+    });
+}
+keepChoice('arrows', () => render());
+keepChoice('kms', () => render());
+keepChoice('pace', () => drawMeter(state));
+keepChoice('profile', ignore);
+keepChoice('elevation', () => drawProfile(state));
+
+loadSaved();
+loadFavorites();
+render();
+if (localStorage.getItem(FAVS_OPEN_KEY) === 'on') showFavorites(true);
+</script>
+</body>
+</html>
